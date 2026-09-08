@@ -1,0 +1,22 @@
+# Recordings and transcripts must never be committed. Output defaults to
+# ~/Documents/livetranscribe, outside this tree, but this is the safety net
+# in case someone points -o back in here.
+meetings/
+*.wav
+*.raw
+*.aiff
+*.m4a
+*.mp3
+*.srt
+*.docx
+transcript*.txt
+transcript*.md
+summary.md
+*-server.log
+debug.log
+
+# Models live in ~/.whisper-models (~8.4 GB) — fetched by bin/lt-setup
+*.bin
+*.gguf
+
+.DS_Store

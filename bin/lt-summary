@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Summarise a transcript and write summary.md + meeting.docx.
+# Usage: lt-summary <transcript.txt> [title]
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+M="${WHISPER_MODELS:-$HOME/.whisper-models}/gemma-3-12b-it-Q4_K_M.gguf"
+source "$HERE/lt-llm.sh"
+
+TXT="${1:?usage: lt-summary <transcript.txt> [title]}"
+[ -s "$TXT" ] || { echo "Empty or missing transcript: $TXT" >&2; exit 1; }
+TITLE="${2:-Meeting $(date '+%Y-%m-%d')}"
+DIR="$(cd "$(dirname "$TXT")" && pwd)"
+PORT="${LT_SUMMARY_PORT:-8130}"
+[ -s "$M" ] || { echo "Summary model missing: $M" >&2; exit 1; }
+
+LLM_PID=""
+trap 'lt_llm_stop' EXIT INT TERM
+
+echo "Loading summary model…"
+lt_llm_start "$M" "$PORT" "$DIR/summary-server.log" || {
+  echo "Could not start llama-server — see $DIR/summary-server.log" >&2; exit 1; }
+python3 "$HERE/lt-summarize.py" "$TXT" --port "$PORT" --title "$TITLE" --outdir "$DIR"
+rc=$?
+lt_llm_stop
+exit $rc

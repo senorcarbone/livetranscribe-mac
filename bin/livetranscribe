@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# Live meeting transcription, fully offline. Swedish->English, or English-only.
+# Usage: livetranscribe [-E] [-d DEVICE] [-s SECONDS] [-o OUTDIR] [-i FILE] [-w] [-S]
+#        livetranscribe -l          list audio input devices
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+MODELS="${WHISPER_MODELS:-$HOME/.whisper-models}"
+M_SV="$MODELS/ggml-large-v3-turbo-q5_0.bin"       # Swedish transcription
+M_EN="$MODELS/ggml-large-v3-q5_0.bin"             # only for legacy -w mode
+M_LLM="$MODELS/gemma-3-12b-it-Q4_K_M.gguf"        # Swedish text -> English text
+DEDUPE="$HERE/lt-dedupe.py"
+XLATE="$HERE/lt-translate.py"
+source "$HERE/lt-llm.sh"
+
+DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1
+OUTDIR="${LT_OUTDIR:-$HOME/Documents/livetranscribe}"
+PORT="${LT_PORT:-8127}"
+RATE_CAP=48000                 # capture at the device's native rate — never
+RATE_ASR=16000                 # resample in the realtime path (it glitches)
+BPS=$((RATE_CAP*2))            # bytes per second of captured raw audio
+
+while getopts "d:s:o:i:wESlh" opt; do
+  case $opt in
+    l) echo "Audio input devices (use the number with -d):"
+       ffmpeg -f avfoundation -list_devices true -i "" 2>&1 \
+         | sed -n '/audio devices/,$p' | grep -oE '\[[0-9]+\] .*' | sed 's/^/  /'
+       exit 0 ;;
+    E) ENGLISH=1 ;;
+    S) SUMMARY=0 ;;
+    d) DEVICE=$OPTARG ;;
+    s) SEG=$OPTARG ;;
+    o) OUTDIR=$OPTARG ;;
+    i) INFILE=$OPTARG ;;
+    w) MODE=whisper ;;
+    h) sed -n '2,3p' "$0"; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+
+# English mode: transcribe English straight through, no translation stage at all.
+# That removes ~1.6 s per step, so it can run a shorter step.
+if [ "$ENGLISH" = 1 ]; then
+  MODE=none
+  ASR_LANG=en
+  [ -z "$SEG" ] && SEG=3
+  # Emit every 2 s, but let Whisper see 6 s of context each time — a 2 s window
+  # on its own gets chopped mid-phrase and the model starts inventing.
+  [ -z "$PREROLL" ] && PREROLL=4
+else
+  ASR_LANG=sv
+  [ -z "$SEG" ] && SEG=4
+  [ -z "$PREROLL" ] && PREROLL=2
+fi
+
+need() { [ -s "$1" ] || { echo "Missing: $1" >&2; exit 1; }; }
+need "$M_SV"; need "$DEDUPE"
+if [ "$MODE" = llm ]; then
+  if [ -s "$M_LLM" ]; then need "$XLATE"
+  else
+    echo "Translation model not found ($M_LLM)." >&2
+    echo "Falling back to Whisper's own translation — see README on its idiom errors." >&2
+    MODE=whisper
+  fi
+fi
+[ "$MODE" = whisper ] && need "$M_EN"
+THREADS=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || echo 8)
+
+# Only one live capture at a time — two would fight over the microphone.
+LOCK="${TMPDIR:-/tmp}/livetranscribe.lock"
+if [ -z "$INFILE" ]; then
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    other=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+      echo "Already recording (pid $other). Stop that first: kill $other" >&2
+      exit 1
+    fi
+    rm -rf "$LOCK"; mkdir -p "$LOCK"
+  fi
+  echo $$ > "$LOCK/pid"
+fi
+
+STAMP=$(date +%Y-%m-%d_%H%M%S)
+RUN="$OUTDIR/$STAMP"; mkdir -p "$RUN"
+RAW="$RUN/stream.raw"; CHUNK="$RUN/.chunk.wav"
+if [ "$ENGLISH" = 1 ]; then
+  SV_TXT="$RUN/transcript.txt"; EN_TXT="$RUN/.unused_en.txt"
+else
+  SV_TXT="$RUN/transcript_sv.txt"; EN_TXT="$RUN/transcript_en.txt"
+fi
+MD="$RUN/transcript.md"
+: > "$SV_TXT"; : > "$EN_TXT"
+{ echo "# Board meeting transcript — $(date '+%Y-%m-%d %H:%M')"; echo; } > "$MD"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; BLUE=$'\033[34m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
+
+FFPID=""; LLM_PID=""; CLEANED=0
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0     # trapped on INT/TERM and EXIT; run once
+  CLEANED=1
+  [ -n "$FFPID" ] && { kill "$FFPID" 2>/dev/null; wait "$FFPID" 2>/dev/null; }
+  lt_llm_stop
+  rm -rf "$LOCK" 2>/dev/null
+  # Build the archive here rather than having ffmpeg write it live: a killed
+  # ffmpeg leaves an unfinalised WAV header (RIFF size 0xFFFFFFFF).
+  if [ -s "$RAW" ]; then
+    printf '%sWriting full_audio.wav…%s' "$DIM" "$RESET"
+    if ffmpeg -hide_banner -loglevel error -y -f s16le -ar $RATE_CAP -ac 1 \
+         -i "$RAW" -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$RUN/full_audio.wav" 2>/dev/null
+    then printf '\r                          \r'; rm -f "$RAW"
+    else echo " failed — raw audio kept at $RAW"; fi
+  fi
+  rm -f "$CHUNK" "$RUN/.chunk.raw"
+  echo; echo "${BOLD}Saved:${RESET}"
+  if [ "$ENGLISH" = 1 ]; then
+    rm -f "$EN_TXT"
+    printf '  %s\n  %s\n' "$SV_TXT" "$MD"
+  else
+    printf '  %s\n  %s\n  %s\n' "$MD" "$SV_TXT" "$EN_TXT"
+  fi
+  echo "  $RUN/full_audio.wav  ${DIM}(full recording — lt-final re-runs it at max accuracy)${RESET}"
+  if [ "$ENGLISH" = 1 ] && [ "$SUMMARY" = 1 ] && [ -s "$SV_TXT" ]; then
+    echo
+    echo "${BOLD}Summarising…${RESET} ${DIM}(loads the 7.3 GB model, ~1 min; Ctrl-C to skip)${RESET}"
+    "$HERE/lt-summary" "$SV_TXT" "Meeting $(date '+%Y-%m-%d %H:%M')"
+  fi
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+# ---- translation server (loaded once, not per chunk) ------------------------
+if [ "$MODE" = llm ]; then
+  printf '%sLoading translation model…%s' "$DIM" "$RESET"
+  if lt_llm_start "$M_LLM" "$PORT" "$RUN/llama-server.log"; then
+    printf '\r%sTranslation model ready.        %s\n' "$DIM" "$RESET"
+  else
+    printf '\r%sTranslation model failed — using Whisper translation.%s\n' "$DIM" "$RESET"
+    MODE=whisper; need "$M_EN"
+  fi
+fi
+
+# ---- recorder ---------------------------------------------------------------
+if [ -n "$INFILE" ]; then IN_ARGS=(-re -i "$INFILE")
+else IN_ARGS=(-f avfoundation -i ":$DEVICE"); fi
+
+# One output only, at the native rate. Two outputs plus a realtime resample
+# under load produced a click on every 512-sample boundary (a 31 Hz buzz).
+ffmpeg -hide_banner -loglevel error -nostdin -y \
+  -thread_queue_size 8192 "${IN_ARGS[@]}" \
+  -ac 1 -ar $RATE_CAP -c:a pcm_s16le -f s16le "$RAW" &
+FFPID=$!
+
+sleep 2
+kill -0 "$FFPID" 2>/dev/null || {
+  echo "Recorder failed to start (see the ffmpeg error above)." >&2
+  echo "Most common cause: no microphone access for your terminal app —" >&2
+  echo "  System Settings > Privacy & Security > Microphone" >&2
+  exit 1; }
+
+if [ -n "$INFILE" ]; then echo "${BOLD}Rehearsal from $INFILE${RESET}"
+else echo "${BOLD}Recording device :$DEVICE${RESET}"; fi
+case "$MODE" in
+  llm)  eng="two-stage (Whisper SV → Gemma EN)" ;;
+  none) eng="English only — no translation" ;;
+  *)    eng="Whisper translate" ;;
+esac
+if [ "$ENGLISH" = 1 ]; then
+  echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Ctrl-C to stop and summarise${RESET}"
+else
+  echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Swedish ${BLUE}blue${RESET}${DIM} / English ${GREEN}green${RESET}${DIM} · Ctrl-C to stop${RESET}"
+fi
+echo
+
+JUNK='Tack för att du tittade|Tack för att ni lyssnade|Tack för att du lyssnade|Undertext|Textning|Svensktext|Thanks for watching|Thank you for watching|Subtitles by|Subtitling|Amara\.org|\[Musik\]|\[Music\]'
+
+clean() { tr '\n' ' ' | sed -e 's/\[[^]]*\]//g' -e 's/([^)]*)//g' \
+    -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]]\{2,\}/ /g'; }
+
+is_junk() {
+  local t="$1"
+  [ -z "$t" ] && return 0
+  [ "${#t}" -lt 2 ] && return 0
+  printf '%s' "$t" | grep -qEi "$JUNK" && return 0
+  printf '%s' "$t" | grep -qE '^[[:punct:][:space:]]+$' && return 0
+  return 1
+}
+
+loud_enough() {
+  local mv
+  mv=$(ffmpeg -hide_banner -nostdin -i "$1" -af volumedetect -f null - 2>&1 \
+       | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p' | head -1)
+  [ -z "$mv" ] && return 0
+  awk -v v="$mv" 'BEGIN{exit !(v > -47)}'
+}
+
+t=0; CTX=""; CTX_EN=""; prev_raw_en=""; prev_sv=""; prev_en=""; prev_xl_sv=""
+T0=$(date +%s); WARNED=0
+while :; do
+  need_bytes=$(( (t + SEG) * BPS ))
+  while [ "$(stat -f%z "$RAW" 2>/dev/null || echo 0)" -lt "$need_bytes" ]; do
+    kill -0 "$FFPID" 2>/dev/null || cleanup
+    sleep 0.3
+  done
+
+  start=$(( t - PREROLL )); [ "$start" -lt 0 ] && start=0
+  dur=$(( t + SEG - start ))
+  dd if="$RAW" of="$RUN/.chunk.raw" bs="$BPS" skip="$start" count="$dur" 2>/dev/null
+  ffmpeg -hide_banner -loglevel error -nostdin -y \
+    -f s16le -ar $RATE_CAP -ac 1 -i "$RUN/.chunk.raw" \
+    -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$CHUNK" 2>/dev/null
+
+  ts=$(printf '%02d:%02d:%02d' $((t/3600)) $((t%3600/60)) $((t%60)))
+  sv=""; en=""; raw_sv=""
+  if loud_enough "$CHUNK"; then
+    # CTX is the tail of what has actually been emitted. Whisper is given it as
+    # --prompt, and it is also what we dedupe against. Using the previous raw
+    # output instead does not work: with a prompt, Whisper sometimes *continues*
+    # from it rather than transcribing the whole window, so the previous output
+    # is a fragment and the next window's repeat has nothing to match.
+    raw_sv=$(whisper-cli -m "$M_SV" -f "$CHUNK" -l "$ASR_LANG" -nt -np -t "$THREADS" -bs 5 \
+               --prompt "$CTX" 2>/dev/null | clean)
+    if ! is_junk "$raw_sv"; then
+      sv=$(python3 "$DEDUPE" "$CTX" "$raw_sv")
+      [ -n "${LT_DEBUG:-}" ] && {
+        printf 'DBG t=%s win=[%s,%s]\n  CTX =%s\n  RAW =%s\n  OUT =%s\n' \
+          "$t" "$start" "$((start+dur))" "$CTX" "$raw_sv" "$sv" >> "$RUN/debug.log"; }
+    fi
+  fi
+
+  # Show the Swedish the moment it exists — do not make the room wait for the
+  # translation, which costs another ~1.6 s.
+  if [ -n "$sv" ]; then
+    if [ "$ENGLISH" = 1 ]; then
+      printf '%s[%s]%s %s\n' "$DIM" "$ts" "$RESET" "$sv"
+    else
+      printf '%s[%s]%s\n  %sSV%s %s\n' "$DIM" "$ts" "$RESET" "$BLUE" "$RESET" "$sv"
+    fi
+    printf '[%s] %s\n' "$ts" "$sv" >> "$SV_TXT"
+    if [ "$ENGLISH" = 1 ]; then
+      printf '**[%s]** %s\n\n' "$ts" "$sv" >> "$MD"
+    else
+      { printf '### %s\n' "$ts"; printf -- '- **SV:** %s\n' "$sv"; } >> "$MD"
+    fi
+    prev_sv="$sv"
+    CTX=$(printf '%s %s' "$CTX" "$sv" | tr -s '[:space:]' '\n' | tail -60 | tr '\n' ' ')
+  fi
+
+  if [ "$MODE" = llm ]; then
+    [ -n "$sv" ] && en=$(python3 "$XLATE" --port "$PORT" \
+          --prev-sv "$prev_xl_sv" --prev-en "$prev_en" "$sv")
+    [ -n "$en" ] && prev_xl_sv="$sv"
+  elif [ "$MODE" = whisper ] && { [ -n "$raw_sv" ] || [ -n "$sv" ]; }; then
+    raw_en=$(whisper-cli -m "$M_EN" -f "$CHUNK" -l sv --translate -nt -np -t "$THREADS" -bs 5 \
+               --prompt "$CTX_EN" 2>/dev/null | clean)
+    if ! is_junk "$raw_en"; then
+      en=$(python3 "$DEDUPE" "$CTX_EN" "$raw_en")
+    fi
+  fi
+
+  if [ -n "$en" ]; then
+    printf '  %sEN%s %s\n' "$GREEN" "$RESET" "$en"
+    printf '[%s] %s\n' "$ts" "$en" >> "$EN_TXT"
+    printf -- '- **EN:** %s\n' "$en" >> "$MD"
+    prev_en="$en"
+    CTX_EN=$(printf '%s %s' "$CTX_EN" "$en" | tr -s '[:space:]' '\n' | tail -60 | tr '\n' ' ')
+  fi
+  if [ -n "$sv" ] || [ -n "$en" ]; then
+    [ "$ENGLISH" = 1 ] || { echo; echo >> "$MD"; }
+  fi
+
+  # warn once if the machine cannot keep up with the chosen step
+  now=$(date +%s); elapsed=$(( now - T0 )); lag=$(( elapsed - t - SEG ))
+  if [ "$lag" -gt $(( SEG * 2 )) ] && [ "$WARNED" = 0 ]; then
+    WARNED=1
+    printf '%s(falling behind by ~%ss — try a larger -s, or -w)%s\n\n' "$DIM" "$lag" "$RESET" >&2
+  fi
+
+  t=$(( t + SEG ))
+done

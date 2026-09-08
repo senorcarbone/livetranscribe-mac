@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# High-accuracy offline re-run over a saved recording.
+# Usage: lt-final /path/to/full_audio.wav [-w]
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+M="${WHISPER_MODELS:-$HOME/.whisper-models}"
+M_LLM="$M/gemma-3-12b-it-Q4_K_M.gguf"
+XLATE="$HERE/lt-translate.py"
+source "$HERE/lt-llm.sh"
+
+AUD="${1:?usage: lt-final <audio-file> [-w]}"; shift
+MODE=llm
+[ "${1:-}" = "-w" ] && MODE=whisper
+
+[ -s "$AUD" ] || { echo "No such audio file: $AUD" >&2; exit 1; }
+OUT="$(cd "$(dirname "$AUD")" && pwd)/final"; mkdir -p "$OUT"
+WAV="$OUT/.input.wav"
+PORT="${LT_PORT:-8128}"
+T=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || echo 8)
+
+LLM_PID=""
+cleanup() { lt_llm_stop; rm -f "$WAV"; }
+trap cleanup EXIT INT TERM
+
+ffmpeg -hide_banner -loglevel error -y -i "$AUD" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV"
+
+VAD=()
+[ -s "$M/ggml-silero-v5.1.2.bin" ] && VAD=(--vad -vm "$M/ggml-silero-v5.1.2.bin")
+
+echo "Swedish transcript (large-v3-turbo, beam 5, VAD)…"
+whisper-cli -m "$M/ggml-large-v3-turbo-q5_0.bin" -f "$WAV" -l sv -bs 5 -t "$T" "${VAD[@]}" \
+  -osrt -otxt -of "$OUT/final_sv" >/dev/null 2>&1 || { echo "Swedish pass failed" >&2; exit 1; }
+
+if [ "$MODE" = llm ] && [ -s "$M_LLM" ]; then
+  echo "English translation (Gemma 3 12B over the Swedish text)…"
+  if lt_llm_start "$M_LLM" "$PORT" "$OUT/llama-server.log"; then
+    python3 "$XLATE" --port "$PORT" --file "$OUT/final_sv.txt" > "$OUT/final_en.txt"
+    [ -s "$OUT/final_sv.srt" ] && \
+      python3 "$XLATE" --port "$PORT" --srt "$OUT/final_sv.srt" > "$OUT/final_en.srt"
+    lt_llm_stop
+  else
+    echo "Translation server failed — see $OUT/llama-server.log" >&2; MODE=whisper
+  fi
+fi
+
+if [ "$MODE" = whisper ]; then
+  echo "English translation (Whisper translate — literal-idiom risk, see README)…"
+  whisper-cli -m "$M/ggml-large-v3-q5_0.bin" -f "$WAV" -l sv --translate -bs 5 -t "$T" "${VAD[@]}" \
+    -osrt -otxt -of "$OUT/final_en" >/dev/null 2>&1
+fi
+
+echo; echo "Done:"; ls -1 "$OUT" | grep -v -e '^\.' -e '\.log$'
