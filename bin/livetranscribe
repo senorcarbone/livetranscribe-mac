@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live meeting transcription, fully offline. Swedish->English, or English-only.
-# Usage: livetranscribe [-E] [-d DEVICE] [-s SECONDS] [-o OUTDIR] [-i FILE] [-w] [-S] [-T]
+# Usage: livetranscribe [-E] [-d DEVICE] [-s SECONDS] [-o OUTDIR] [-i FILE] [-w] [-S] [-T] [-N]
 #        livetranscribe -l          list audio input devices
 set -uo pipefail
 
@@ -14,14 +14,14 @@ SEGMENT="$HERE/lt-segment.py"
 XLATE="$HERE/lt-translate.py"
 source "$HERE/lt-llm.sh"
 
-DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1; TIMED=0
+DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1; TIMED=0; KEEP_AUDIO=1
 OUTDIR="${LT_OUTDIR:-$HOME/Documents/livetranscribe}"
 PORT="${LT_PORT:-8127}"
 RATE_CAP=48000                 # capture at the device's native rate — never
 RATE_ASR=16000                 # resample in the realtime path (it glitches)
 BPS=$((RATE_CAP*2))            # bytes per second of captured raw audio
 
-while getopts "d:s:o:i:wESTlh" opt; do
+while getopts "d:s:o:i:wESTNlh" opt; do
   case $opt in
     l) echo "Audio input devices (use the number with -d):"
        ffmpeg -f avfoundation -list_devices true -i "" 2>&1 \
@@ -30,6 +30,7 @@ while getopts "d:s:o:i:wESTlh" opt; do
     E) ENGLISH=1 ;;
     S) SUMMARY=0 ;;
     T) TIMED=1 ;;
+    N) KEEP_AUDIO=0 ;;
     d) DEVICE=$OPTARG ;;
     s) SEG=$OPTARG; SEG_GIVEN=1 ;;
     o) OUTDIR=$OPTARG ;;
@@ -114,7 +115,9 @@ cleanup() {
   rm -rf "$LOCK" 2>/dev/null
   # Build the archive here rather than having ffmpeg write it live: a killed
   # ffmpeg leaves an unfinalised WAV header (RIFF size 0xFFFFFFFF).
-  if [ -s "$RAW" ]; then
+  if [ "$KEEP_AUDIO" = 0 ]; then
+    rm -f "$RAW"
+  elif [ -s "$RAW" ]; then
     printf '%sWriting full_audio.wav…%s' "$DIM" "$RESET"
     if ffmpeg -hide_banner -loglevel error -y -f s16le -ar $RATE_CAP -ac 1 \
          -i "$RAW" -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$RUN/full_audio.wav" 2>/dev/null
@@ -129,7 +132,11 @@ cleanup() {
   else
     printf '  %s\n  %s\n  %s\n' "$MD" "$SV_TXT" "$EN_TXT"
   fi
-  echo "  $RUN/full_audio.wav  ${DIM}(full recording — lt-final re-runs it at max accuracy)${RESET}"
+  if [ "$KEEP_AUDIO" = 1 ]; then
+    echo "  $RUN/full_audio.wav  ${DIM}(full recording — lt-final re-runs it at max accuracy)${RESET}"
+  else
+    echo "  ${DIM}no audio kept (-N); lt-final cannot be run on this meeting${RESET}"
+  fi
   if [ "$ENGLISH" = 1 ] && [ "$SUMMARY" = 1 ] && [ -s "$SV_TXT" ]; then
     echo
     echo "${BOLD}Summarising…${RESET} ${DIM}(loads the 7.3 GB model, ~1 min; Ctrl-C to skip)${RESET}"
@@ -190,6 +197,8 @@ else
   echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Swedish ${BLUE}blue${RESET}${DIM} / English ${GREEN}green${RESET}${DIM} · Ctrl-C to stop${RESET}"
 fi
 echo
+
+[ "$KEEP_AUDIO" = 0 ] && echo "${DIM}-N: audio is discarded on exit; text only.${RESET}"
 
 JUNK='Tack för att du tittade|Tack för att ni lyssnade|Tack för att du lyssnade|Undertext|Textning|Svensktext|Thanks for watching|Thank you for watching|Subtitles by|Subtitling|Amara\.org|\[Musik\]|\[Music\]'
 

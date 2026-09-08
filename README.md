@@ -93,6 +93,7 @@ the Mac cannot keep up at your chosen step, it says so and you should raise `-s`
 | `-E` | English-audio mode (see below) | off |
 | `-S` | skip the automatic summary in English mode | off |
 | `-T` | fixed-interval chunks instead of utterance segmentation | off |
+| `-N` | discard the audio on exit — text only | off (audio kept) |
 
 List devices: `./bin/livetranscribe -l`
 
@@ -251,6 +252,26 @@ against `final_sv.txt` or the audio before it goes on record.
 - No speaker labels — one continuous stream, not "who said what".
 - Overlapping speech degrades badly.
 - Proper nouns and numbers are the usual error sites on the Swedish side too.
+
+## Not keeping the audio
+
+`-N` discards the recording when the run ends, leaving only the transcript:
+
+```sh
+./bin/livetranscribe -E -N
+```
+
+Worth knowing what you give up: `lt-final` needs the audio, so there is no
+higher-accuracy second pass and no way to check a figure against what was said. The
+live transcript becomes the only record, and it is the less accurate of the two. For
+minutes that matter, keeping the audio until the meeting is written up is usually the
+better trade.
+
+Also note this is not the same as never writing audio to disk. The capture stream is
+buffered to a file while running because the transcriber reads back from it; `-N` means
+that file is deleted on exit rather than converted to `full_audio.wav`. If audio must
+never touch the disk at all, that needs a different design — say so and it can be piped
+instead.
 
 ## Checking a recording
 
