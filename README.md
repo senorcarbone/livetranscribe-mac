@@ -8,8 +8,11 @@ Two modes:
 
 | | Command | What you get |
 |---|---|---|
-| **Swedish** | `livetranscribe` | Swedish + English side by side, ~5 s behind the room |
-| **English** | `livetranscribe -E` | English text only, one line per utterance, then a summary + `.docx` |
+| **Swedish** | `livetranscribe` | Swedish + English side by side |
+| **English** | `livetranscribe -E` | English text only, then a summary + `.docx` |
+
+Both emit **one line per utterance**, cut in the silence around each phrase rather than
+on a fixed timer, so every line is a whole thought.
 
 Swedish→English does **not** use Whisper's own translation, which renders business
 idiom literally ("skjuta upp nyanställningarna" → "shoot up the new employees").
@@ -62,6 +65,15 @@ repository so recordings can never be committed. Override with `-o` or `$LT_OUTD
 ./bin/livetranscribe
 ```
 
+One line per utterance. The Swedish appears about a second after the speaker pauses and
+the English follows roughly 1.6 s later, because it is not held back waiting for the
+translation.
+
+Segmenting on speech helps the translation as much as the transcription: a whole
+sentence translates correctly where a fragment does not. On fixed intervals the
+fragment "Framför" (the start of "framför allt personalkostnaderna") was rendered as
+"Moving on"; as part of a complete utterance it becomes "Primarily personnel costs".
+
 A running transcript prints with Swedish (blue) above English (green). `Ctrl-C` stops
 and saves.
 
@@ -80,7 +92,7 @@ the Mac cannot keep up at your chosen step, it says so and you should raise `-s`
 | `-w` | use Whisper's own translation instead of stage 2 (not recommended) | off |
 | `-E` | English-audio mode (see below) | off |
 | `-S` | skip the automatic summary in English mode | off |
-| `-T` | English mode: fixed-interval chunks instead of utterance segmentation | off |
+| `-T` | fixed-interval chunks instead of utterance segmentation | off |
 
 List devices: `./bin/livetranscribe -l`
 
@@ -96,18 +108,22 @@ the two.
 ./bin/livetranscribe -E
 ```
 
-It emits **one line per utterance**, cutting in the silence around each phrase rather
-than on a fixed timer, so each line is a whole thought and Whisper always sees complete
-context. Text appears roughly a second after the speaker pauses.
+One line per utterance, appearing roughly a second after the speaker pauses.
 
 That is what fixes the fragmenting: on a timer, "forty two million" straddled a boundary
 and came out as `Revenue came in at $42.` / `up 12% Euro`. Segmented on speech, the same
 audio gives `Revenue came in at 42 million, up 12% year over year.` — identical to what
 Whisper produces from the whole file at once.
 
-Speech detection adapts to the room's noise floor, so it needs no tuning. A phrase
-longer than 12 s is cut anyway, to keep latency bounded. `-T` reverts to the old fixed
-interval if you ever want it.
+### Utterance segmentation, in both modes
+
+Speech detection tracks the room's noise floor and sits a margin above it, so it needs
+no tuning for a quiet or a noisy room. A phrase running longer than 12 s is cut anyway
+to keep latency bounded; that cut can mangle the word it lands on, but nothing is lost
+either side of it. In practice only unbroken monologue reaches that limit.
+
+`-T` reverts to fixed intervals, and `-s` sets their length. Under utterance
+segmentation `-s` has no meaning and the tool says so rather than ignoring it.
 
 On `Ctrl-C` it transcribes, then automatically writes a summary and a Word document:
 

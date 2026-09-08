@@ -31,7 +31,7 @@ while getopts "d:s:o:i:wESTlh" opt; do
     S) SUMMARY=0 ;;
     T) TIMED=1 ;;
     d) DEVICE=$OPTARG ;;
-    s) SEG=$OPTARG ;;
+    s) SEG=$OPTARG; SEG_GIVEN=1 ;;
     o) OUTDIR=$OPTARG ;;
     i) INFILE=$OPTARG ;;
     w) MODE=whisper ;;
@@ -52,9 +52,14 @@ if [ "$ENGLISH" = 1 ]; then
   [ -z "$PREROLL" ] && PREROLL=4
 else
   ASR_LANG=sv
-  VAD=0
+  [ "$TIMED" = 0 ] && VAD=1 || VAD=0
   [ -z "$SEG" ] && SEG=4
   [ -z "$PREROLL" ] && PREROLL=2
+fi
+
+# -s only means anything when chunks are cut on a clock
+if [ -n "${SEG_GIVEN:-}" ] && [ "$VAD" = 1 ]; then
+  echo "Note: -s applies to the fixed-interval mode; add -T to use it." >&2
 fi
 
 need() { [ -s "$1" ] || { echo "Missing: $1" >&2; exit 1; }; }
@@ -179,6 +184,8 @@ if [ "$ENGLISH" = 1 ]; then
   else
     echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Ctrl-C to stop and summarise${RESET}"
   fi
+elif [ "$VAD" = 1 ]; then
+  echo "${DIM}one line per utterance · $eng · Swedish ${BLUE}blue${RESET}${DIM} / English ${GREEN}green${RESET}${DIM} · Ctrl-C to stop${RESET}"
 else
   echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Swedish ${BLUE}blue${RESET}${DIM} / English ${GREEN}green${RESET}${DIM} · Ctrl-C to stop${RESET}"
 fi
