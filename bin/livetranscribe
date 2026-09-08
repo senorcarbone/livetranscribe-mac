@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live meeting transcription, fully offline. Swedish->English, or English-only.
-# Usage: livetranscribe [-E] [-d DEVICE] [-s SECONDS] [-o OUTDIR] [-i FILE] [-w] [-S]
+# Usage: livetranscribe [-E] [-d DEVICE] [-s SECONDS] [-o OUTDIR] [-i FILE] [-w] [-S] [-T]
 #        livetranscribe -l          list audio input devices
 set -uo pipefail
 
@@ -10,17 +10,18 @@ M_SV="$MODELS/ggml-large-v3-turbo-q5_0.bin"       # Swedish transcription
 M_EN="$MODELS/ggml-large-v3-q5_0.bin"             # only for legacy -w mode
 M_LLM="$MODELS/gemma-3-12b-it-Q4_K_M.gguf"        # Swedish text -> English text
 DEDUPE="$HERE/lt-dedupe.py"
+SEGMENT="$HERE/lt-segment.py"
 XLATE="$HERE/lt-translate.py"
 source "$HERE/lt-llm.sh"
 
-DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1
+DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1; TIMED=0
 OUTDIR="${LT_OUTDIR:-$HOME/Documents/livetranscribe}"
 PORT="${LT_PORT:-8127}"
 RATE_CAP=48000                 # capture at the device's native rate — never
 RATE_ASR=16000                 # resample in the realtime path (it glitches)
 BPS=$((RATE_CAP*2))            # bytes per second of captured raw audio
 
-while getopts "d:s:o:i:wESlh" opt; do
+while getopts "d:s:o:i:wESTlh" opt; do
   case $opt in
     l) echo "Audio input devices (use the number with -d):"
        ffmpeg -f avfoundation -list_devices true -i "" 2>&1 \
@@ -28,6 +29,7 @@ while getopts "d:s:o:i:wESlh" opt; do
        exit 0 ;;
     E) ENGLISH=1 ;;
     S) SUMMARY=0 ;;
+    T) TIMED=1 ;;
     d) DEVICE=$OPTARG ;;
     s) SEG=$OPTARG ;;
     o) OUTDIR=$OPTARG ;;
@@ -43,18 +45,21 @@ done
 if [ "$ENGLISH" = 1 ]; then
   MODE=none
   ASR_LANG=en
+  [ "$TIMED" = 0 ] && VAD=1 || VAD=0
   [ -z "$SEG" ] && SEG=3
   # Emit every 2 s, but let Whisper see 6 s of context each time — a 2 s window
   # on its own gets chopped mid-phrase and the model starts inventing.
   [ -z "$PREROLL" ] && PREROLL=4
 else
   ASR_LANG=sv
+  VAD=0
   [ -z "$SEG" ] && SEG=4
   [ -z "$PREROLL" ] && PREROLL=2
 fi
 
 need() { [ -s "$1" ] || { echo "Missing: $1" >&2; exit 1; }; }
 need "$M_SV"; need "$DEDUPE"
+[ "${VAD:-0}" = 1 ] && need "$SEGMENT"
 if [ "$MODE" = llm ]; then
   if [ -s "$M_LLM" ]; then need "$XLATE"
   else
@@ -94,10 +99,11 @@ MD="$RUN/transcript.md"
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; BLUE=$'\033[34m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 
-FFPID=""; LLM_PID=""; CLEANED=0
+FFPID=""; LLM_PID=""; SEGPID=""; CLEANED=0
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0     # trapped on INT/TERM and EXIT; run once
   CLEANED=1
+  [ -n "$SEGPID" ] && kill "$SEGPID" 2>/dev/null
   [ -n "$FFPID" ] && { kill "$FFPID" 2>/dev/null; wait "$FFPID" 2>/dev/null; }
   lt_llm_stop
   rm -rf "$LOCK" 2>/dev/null
@@ -110,7 +116,7 @@ cleanup() {
     then printf '\r                          \r'; rm -f "$RAW"
     else echo " failed — raw audio kept at $RAW"; fi
   fi
-  rm -f "$CHUNK" "$RUN/.chunk.raw"
+  rm -f "$CHUNK" "$RUN/.chunk.raw" "$RUN/.utts" "$RUN"/.utt_*.wav
   echo; echo "${BOLD}Saved:${RESET}"
   if [ "$ENGLISH" = 1 ]; then
     rm -f "$EN_TXT"
@@ -145,9 +151,12 @@ else IN_ARGS=(-f avfoundation -i ":$DEVICE"); fi
 
 # One output only, at the native rate. Two outputs plus a realtime resample
 # under load produced a click on every 512-sample boundary (a 31 Hz buzz).
+# -flush_packets 1 matters: without it the raw muxer buffers ~256 KB, i.e. about
+# 2.7 s of audio, which both delays every chunk and makes the utterance
+# segmenter mistake the gap for the end of the recording.
 ffmpeg -hide_banner -loglevel error -nostdin -y \
   -thread_queue_size 8192 "${IN_ARGS[@]}" \
-  -ac 1 -ar $RATE_CAP -c:a pcm_s16le -f s16le "$RAW" &
+  -ac 1 -ar $RATE_CAP -c:a pcm_s16le -flush_packets 1 -f s16le "$RAW" &
 FFPID=$!
 
 sleep 2
@@ -165,7 +174,11 @@ case "$MODE" in
   *)    eng="Whisper translate" ;;
 esac
 if [ "$ENGLISH" = 1 ]; then
-  echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Ctrl-C to stop and summarise${RESET}"
+  if [ "$VAD" = 1 ]; then
+    echo "${DIM}one line per utterance · $eng · Ctrl-C to stop and summarise${RESET}"
+  else
+    echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Ctrl-C to stop and summarise${RESET}"
+  fi
 else
   echo "${DIM}${SEG}s steps, ${PREROLL}s overlap · $eng · Swedish ${BLUE}blue${RESET}${DIM} / English ${GREEN}green${RESET}${DIM} · Ctrl-C to stop${RESET}"
 fi
@@ -193,38 +206,32 @@ loud_enough() {
   awk -v v="$mv" 'BEGIN{exit !(v > -47)}'
 }
 
-t=0; CTX=""; CTX_EN=""; prev_raw_en=""; prev_sv=""; prev_en=""; prev_xl_sv=""
-T0=$(date +%s); WARNED=0
-while :; do
-  need_bytes=$(( (t + SEG) * BPS ))
-  while [ "$(stat -f%z "$RAW" 2>/dev/null || echo 0)" -lt "$need_bytes" ]; do
-    kill -0 "$FFPID" 2>/dev/null || cleanup
-    sleep 0.3
-  done
+CTX=""; CTX_EN=""; prev_sv=""; prev_en=""; prev_xl_sv=""
 
-  start=$(( t - PREROLL )); [ "$start" -lt 0 ] && start=0
-  dur=$(( t + SEG - start ))
-  dd if="$RAW" of="$RUN/.chunk.raw" bs="$BPS" skip="$start" count="$dur" 2>/dev/null
-  ffmpeg -hide_banner -loglevel error -nostdin -y \
-    -f s16le -ar $RATE_CAP -ac 1 -i "$RUN/.chunk.raw" \
-    -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$CHUNK" 2>/dev/null
-
-  ts=$(printf '%02d:%02d:%02d' $((t/3600)) $((t%3600/60)) $((t%60)))
+# Transcribe one prepared 16 kHz chunk and emit it.  $1 = wav, $2 = start seconds,
+# $3 = 1 if the chunk is a whole utterance (no overlap, so nothing to dedupe).
+handle_chunk() {
+  local wav="$1" at="$2" whole="${3:-0}"
+  local ts sv en raw_sv raw_en
+  ts=$(printf '%02d:%02d:%02d' $((at/3600)) $((at%3600/60)) $((at%60)))
   sv=""; en=""; raw_sv=""
-  if loud_enough "$CHUNK"; then
-    # CTX is the tail of what has actually been emitted. Whisper is given it as
-    # --prompt, and it is also what we dedupe against. Using the previous raw
-    # output instead does not work: with a prompt, Whisper sometimes *continues*
-    # from it rather than transcribing the whole window, so the previous output
-    # is a fragment and the next window's repeat has nothing to match.
-    raw_sv=$(whisper-cli -m "$M_SV" -f "$CHUNK" -l "$ASR_LANG" -nt -np -t "$THREADS" -bs 5 \
-               --prompt "$CTX" 2>/dev/null | clean)
-    if ! is_junk "$raw_sv"; then
+  loud_enough "$wav" || return 0
+
+  # CTX is the tail of what has actually been emitted. Whisper is given it as
+  # --prompt, and for overlapping windows it is also what we dedupe against.
+  # Using the previous raw output instead does not work: with a prompt, Whisper
+  # sometimes *continues* from it rather than transcribing the whole window, so
+  # the previous output is a fragment that later repeats cannot match.
+  raw_sv=$(whisper-cli -m "$M_SV" -f "$wav" -l "$ASR_LANG" -nt -np -t "$THREADS" -bs 5 \
+             --prompt "$CTX" 2>/dev/null | clean)
+  if ! is_junk "$raw_sv"; then
+    if [ "$whole" = 1 ]; then
+      sv="$raw_sv"                       # utterance boundaries never overlap
+    else
       sv=$(python3 "$DEDUPE" "$CTX" "$raw_sv")
-      [ -n "${LT_DEBUG:-}" ] && {
-        printf 'DBG t=%s win=[%s,%s]\n  CTX =%s\n  RAW =%s\n  OUT =%s\n' \
-          "$t" "$start" "$((start+dur))" "$CTX" "$raw_sv" "$sv" >> "$RUN/debug.log"; }
     fi
+    [ -n "${LT_DEBUG:-}" ] && printf 'DBG at=%s whole=%s\n  CTX =%s\n  RAW =%s\n  OUT =%s\n' \
+        "$at" "$whole" "$CTX" "$raw_sv" "$sv" >> "$RUN/debug.log"
   fi
 
   # Show the Swedish the moment it exists — do not make the room wait for the
@@ -232,15 +239,12 @@ while :; do
   if [ -n "$sv" ]; then
     if [ "$ENGLISH" = 1 ]; then
       printf '%s[%s]%s %s\n' "$DIM" "$ts" "$RESET" "$sv"
-    else
-      printf '%s[%s]%s\n  %sSV%s %s\n' "$DIM" "$ts" "$RESET" "$BLUE" "$RESET" "$sv"
-    fi
-    printf '[%s] %s\n' "$ts" "$sv" >> "$SV_TXT"
-    if [ "$ENGLISH" = 1 ]; then
       printf '**[%s]** %s\n\n' "$ts" "$sv" >> "$MD"
     else
+      printf '%s[%s]%s\n  %sSV%s %s\n' "$DIM" "$ts" "$RESET" "$BLUE" "$RESET" "$sv"
       { printf '### %s\n' "$ts"; printf -- '- **SV:** %s\n' "$sv"; } >> "$MD"
     fi
+    printf '[%s] %s\n' "$ts" "$sv" >> "$SV_TXT"
     prev_sv="$sv"
     CTX=$(printf '%s %s' "$CTX" "$sv" | tr -s '[:space:]' '\n' | tail -60 | tr '\n' ' ')
   fi
@@ -250,10 +254,10 @@ while :; do
           --prev-sv "$prev_xl_sv" --prev-en "$prev_en" "$sv")
     [ -n "$en" ] && prev_xl_sv="$sv"
   elif [ "$MODE" = whisper ] && { [ -n "$raw_sv" ] || [ -n "$sv" ]; }; then
-    raw_en=$(whisper-cli -m "$M_EN" -f "$CHUNK" -l sv --translate -nt -np -t "$THREADS" -bs 5 \
+    raw_en=$(whisper-cli -m "$M_EN" -f "$wav" -l sv --translate -nt -np -t "$THREADS" -bs 5 \
                --prompt "$CTX_EN" 2>/dev/null | clean)
     if ! is_junk "$raw_en"; then
-      en=$(python3 "$DEDUPE" "$CTX_EN" "$raw_en")
+      if [ "$whole" = 1 ]; then en="$raw_en"; else en=$(python3 "$DEDUPE" "$CTX_EN" "$raw_en"); fi
     fi
   fi
 
@@ -267,13 +271,49 @@ while :; do
   if [ -n "$sv" ] || [ -n "$en" ]; then
     [ "$ENGLISH" = 1 ] || { echo; echo >> "$MD"; }
   fi
+  return 0
+}
 
-  # warn once if the machine cannot keep up with the chosen step
-  now=$(date +%s); elapsed=$(( now - T0 )); lag=$(( elapsed - t - SEG ))
-  if [ "$lag" -gt $(( SEG * 2 )) ] && [ "$WARNED" = 0 ]; then
-    WARNED=1
-    printf '%s(falling behind by ~%ss — try a larger -s, or -w)%s\n\n' "$DIM" "$lag" "$RESET" >&2
-  fi
+if [ "$VAD" = 1 ]; then
+  # ---- utterance driven: one line per phrase, cut in the silence around it ----
+  FIFO="$RUN/.utts"; rm -f "$FIFO"; mkfifo "$FIFO"
+  python3 "$SEGMENT" "$RAW" --workdir "$RUN" --rate "$RATE_CAP" \
+    --eof-idle 3.0 > "$FIFO" 2>>"$RUN/segment.log" &
+  SEGPID=$!
+  while read -r idx at; do
+    utt="$RUN/.utt_$(printf '%05d' "$idx").wav"
+    [ -s "$utt" ] || continue
+    ffmpeg -hide_banner -loglevel error -nostdin -y -i "$utt" \
+      -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$CHUNK" 2>/dev/null
+    rm -f "$utt"
+    handle_chunk "$CHUNK" "${at%.*}" 1
+  done < "$FIFO"
+  cleanup
+else
+  # ---- timer driven: overlapping fixed windows, deduplicated ----
+  t=0; T0=$(date +%s); WARNED=0
+  while :; do
+    need_bytes=$(( (t + SEG) * BPS ))
+    while [ "$(stat -f%z "$RAW" 2>/dev/null || echo 0)" -lt "$need_bytes" ]; do
+      kill -0 "$FFPID" 2>/dev/null || cleanup
+      sleep 0.3
+    done
 
-  t=$(( t + SEG ))
-done
+    start=$(( t - PREROLL )); [ "$start" -lt 0 ] && start=0
+    dur=$(( t + SEG - start ))
+    dd if="$RAW" of="$RUN/.chunk.raw" bs="$BPS" skip="$start" count="$dur" 2>/dev/null
+    ffmpeg -hide_banner -loglevel error -nostdin -y \
+      -f s16le -ar $RATE_CAP -ac 1 -i "$RUN/.chunk.raw" \
+      -ar $RATE_ASR -ac 1 -c:a pcm_s16le "$CHUNK" 2>/dev/null
+
+    handle_chunk "$CHUNK" "$t" 0
+
+    now=$(date +%s); elapsed=$(( now - T0 )); lag=$(( elapsed - t - SEG ))
+    if [ "$lag" -gt $(( SEG * 2 )) ] && [ "$WARNED" = 0 ]; then
+      WARNED=1
+      printf '%s(falling behind by ~%ss — try a larger -s, or -w)%s\n\n' "$DIM" "$lag" "$RESET" >&2
+    fi
+
+    t=$(( t + SEG ))
+  done
+fi

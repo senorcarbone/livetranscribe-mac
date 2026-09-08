@@ -9,7 +9,7 @@ Two modes:
 | | Command | What you get |
 |---|---|---|
 | **Swedish** | `livetranscribe` | Swedish + English side by side, ~5 s behind the room |
-| **English** | `livetranscribe -E` | English text only, ~4 s behind, then a summary + `.docx` |
+| **English** | `livetranscribe -E` | English text only, one line per utterance, then a summary + `.docx` |
 
 Swedish→English does **not** use Whisper's own translation, which renders business
 idiom literally ("skjuta upp nyanställningarna" → "shoot up the new employees").
@@ -80,6 +80,7 @@ the Mac cannot keep up at your chosen step, it says so and you should raise `-s`
 | `-w` | use Whisper's own translation instead of stage 2 (not recommended) | off |
 | `-E` | English-audio mode (see below) | off |
 | `-S` | skip the automatic summary in English mode | off |
+| `-T` | English mode: fixed-interval chunks instead of utterance segmentation | off |
 
 List devices: `./bin/livetranscribe -l`
 
@@ -88,12 +89,25 @@ the whole meeting rather than reloading per chunk.
 
 ## English mode
 
-For meetings held in English. There is no translation stage at all, so it is the
-faster of the two — text lands about **4 seconds** behind the room.
+For meetings held in English. There is no translation stage, so it is the faster of
+the two.
 
 ```sh
 ./bin/livetranscribe -E
 ```
+
+It emits **one line per utterance**, cutting in the silence around each phrase rather
+than on a fixed timer, so each line is a whole thought and Whisper always sees complete
+context. Text appears roughly a second after the speaker pauses.
+
+That is what fixes the fragmenting: on a timer, "forty two million" straddled a boundary
+and came out as `Revenue came in at $42.` / `up 12% Euro`. Segmented on speech, the same
+audio gives `Revenue came in at 42 million, up 12% year over year.` — identical to what
+Whisper produces from the whole file at once.
+
+Speech detection adapts to the room's noise floor, so it needs no tuning. A phrase
+longer than 12 s is cut anyway, to keep latency bounded. `-T` reverts to the old fixed
+interval if you ever want it.
 
 On `Ctrl-C` it transcribes, then automatically writes a summary and a Word document:
 
@@ -116,12 +130,10 @@ It map-reduces, so meeting length is not a limit.
 
 ### On step size
 
-`-s` sets how often text is emitted. Shorter is not automatically better: at `-s 2`
-Whisper sees too little context and starts inventing — in testing "forty two million"
-became "$42." and then "up 12% Euro". At the `-s 3` default the same audio came out
-as "42 million, up 12% year-over-year". English mode always gives Whisper a 7-second
-window regardless of step, so shortening the step costs less accuracy than it used to,
-but `-s 2` is still visibly worse.
+`-s` applies to Swedish mode and to English `-T`, setting how often text is emitted.
+Shorter is not automatically better: at `-s 2` Whisper sees too little context and
+starts inventing. English mode's default utterance segmentation sidesteps the question
+entirely, which is why it is the default.
 
 ## Zoom, Teams and other calls
 
