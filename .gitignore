@@ -20,3 +20,5 @@ debug.log
 *.gguf
 
 .DS_Store
+__pycache__/
+.claude/
