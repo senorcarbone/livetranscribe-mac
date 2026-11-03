@@ -98,7 +98,11 @@ def main():
                     if en:
                         prev_sv, prev_en = body, en
         else:
-            print(translate(a.text, a.port, a.prev_sv, a.prev_en))
+            # Live line: better to drop one translation than freeze the screen.
+            print(translate(a.text, a.port, a.prev_sv, a.prev_en, timeout=15))
+    except TimeoutError:
+        print("lt-translate: translation timed out", file=sys.stderr)
+        sys.exit(4)
     except urllib.error.URLError as e:
         print(f"lt-translate: cannot reach llama-server on port {a.port}: {e}",
               file=sys.stderr)
