@@ -109,11 +109,12 @@ MD="$RUN/transcript.md"
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; BLUE=$'\033[34m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 
-FFPID=""; LLM_PID=""; SEGPID=""; CLEANED=0
+FFPID=""; LLM_PID=""; SEGPID=""; KEYPID=""; CLEANED=0
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0     # trapped on INT/TERM and EXIT; run once
   CLEANED=1
   [ -n "$SEGPID" ] && kill "$SEGPID" 2>/dev/null
+  [ -n "$KEYPID" ] && { kill "$KEYPID" 2>/dev/null; stty sane 2>/dev/null; }
   [ -n "$FFPID" ] && { kill "$FFPID" 2>/dev/null; wait "$FFPID" 2>/dev/null; }
   lt_llm_stop
   rm -rf "$LOCK" 2>/dev/null
@@ -128,7 +129,7 @@ cleanup() {
     then printf '\r                          \r'; rm -f "$RAW"
     else echo " failed — raw audio kept at $RAW"; fi
   fi
-  rm -f "$CHUNK" "$RUN/.chunk.raw" "$RUN/.utts" "$RUN"/.utt_*.wav
+  rm -f "$CHUNK" "$RUN/.chunk.raw" "$RUN/.utts" "$RUN/.flush" "$RUN"/.utt_*.wav
   echo; echo "${BOLD}Saved:${RESET}"
   if [ "$ENGLISH" = 1 ]; then
     rm -f "$EN_TXT"
@@ -313,8 +314,16 @@ if [ "$VAD" = 1 ]; then
   # ---- utterance driven: one line per phrase, cut in the silence around it ----
   FIFO="$RUN/.utts"; rm -f "$FIFO"; mkfifo "$FIFO"
   python3 "$SEGMENT" "$RAW" --workdir "$RUN" --rate "$RATE_CAP" \
-    --eof-idle 3.0 ${SEG_ARGS[@]+"${SEG_ARGS[@]}"} > "$FIFO" 2>>"$RUN/segment.log" &
+    --eof-idle 3.0 --flush-file "$RUN/.flush" ${SEG_ARGS[@]+"${SEG_ARGS[@]}"} \
+    > "$FIFO" 2>>"$RUN/segment.log" &
   SEGPID=$!
+  # Space or Enter: translate what has been said so far without waiting for a pause.
+  if [ -t 0 ]; then
+    echo "${DIM}Press Space or Enter to translate what has been said so far.${RESET}"
+    echo
+    ( while IFS= read -rsn1 _ < /dev/tty; do : > "$RUN/.flush"; done ) &
+    KEYPID=$!
+  fi
   while read -r idx at; do
     utt="$RUN/.utt_$(printf '%05d' "$idx").wav"
     [ -s "$utt" ] || continue

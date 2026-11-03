@@ -27,6 +27,8 @@ def main():
                     help="past this length, a short pause is enough to cut (0 = off)")
     ap.add_argument("--soft-silence-ms", type=int, default=160,
                     help="the short pause that --soft-ms accepts")
+    ap.add_argument("--flush-file",
+                    help="when this file appears, cut the utterance in progress now")
     ap.add_argument("--pad-ms", type=int, default=200,
                     help="keep this much either side of the speech")
     ap.add_argument("--eof-idle", type=float, default=3.0,
@@ -88,6 +90,15 @@ def main():
         last_growth = time.time()
         frame = np.frombuffer(chunk, dtype=np.int16)
         consumed += frame.size
+
+        # Hotkey: the user asked for what has been said so far, right now.
+        if a.flush_file and os.path.exists(a.flush_file):
+            os.remove(a.flush_file)
+            if in_speech and buf.size:
+                emit(buf, buf_start)
+                in_speech = False
+                buf = np.zeros(0, dtype=np.int16)
+                tail = np.zeros(0, dtype=np.int16)
 
         rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))) + 1e-9
         db = 20 * np.log10(rms / 32768.0)
