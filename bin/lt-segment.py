@@ -23,6 +23,10 @@ def main():
                     help="shorter bursts are treated as noise")
     ap.add_argument("--max-ms", type=int, default=12000,
                     help="force a cut so latency stays bounded")
+    ap.add_argument("--soft-ms", type=int, default=0,
+                    help="past this length, a short pause is enough to cut (0 = off)")
+    ap.add_argument("--soft-silence-ms", type=int, default=160,
+                    help="the short pause that --soft-ms accepts")
     ap.add_argument("--pad-ms", type=int, default=200,
                     help="keep this much either side of the speech")
     ap.add_argument("--eof-idle", type=float, default=3.0,
@@ -33,6 +37,8 @@ def main():
     need_sil = max(1, a.silence_ms // a.frame_ms)
     need_speech = max(1, a.min_speech_ms // a.frame_ms)
     max_frames = max(1, a.max_ms // a.frame_ms)
+    soft_frames = a.soft_ms // a.frame_ms if a.soft_ms else 0
+    need_soft_sil = max(1, a.soft_silence_ms // a.frame_ms)
     pad = int(a.rate * a.pad_ms / 1000)
 
     # Wait for the recorder to create the file.
@@ -111,7 +117,10 @@ def main():
             if in_speech:
                 buf = np.concatenate((buf, frame))
                 sil_run += 1
-                if sil_run >= need_sil:
+                # A long utterance closes on a breath rather than a full pause,
+                # so text keeps flowing during continuous speech.
+                long_enough = soft_frames and speech_frames >= soft_frames
+                if sil_run >= need_sil or (long_enough and sil_run >= need_soft_sil):
                     if speech_frames >= need_speech:
                         emit(buf, buf_start)
                     in_speech = False

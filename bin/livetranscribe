@@ -56,6 +56,10 @@ else
   [ "$TIMED" = 0 ] && VAD=1 || VAD=0
   [ -z "$SEG" ] && SEG=4
   [ -z "$PREROLL" ] && PREROLL=2
+  # Live reading wants text every few seconds, not after a 12 s monologue:
+  # past 4 s any breath closes the line, and nothing runs longer than 7 s.
+  # lt-final redoes the whole recording at full accuracy for the record.
+  SEG_ARGS=(--soft-ms 4000 --max-ms 7000 --silence-ms 500)
 fi
 
 # -s only means anything when chunks are cut on a clock
@@ -178,6 +182,21 @@ kill -0 "$FFPID" 2>/dev/null || {
   echo "  System Settings > Privacy & Security > Microphone" >&2
   exit 1; }
 
+# Without microphone permission macOS does not refuse — it hands over pure
+# digital silence, and the run produces nothing. Say so instead.
+if [ -z "$INFILE" ]; then
+  ( sleep 4
+    peak=$(ffmpeg -hide_banner -nostdin -f s16le -ar $RATE_CAP -ac 1 -t 3 -i "$RAW" \
+             -af volumedetect -f null - 2>&1 | sed -n 's/.*max_volume: \(-*[0-9.]*\) dB.*/\1/p')
+    if [ -n "$peak" ] && awk -v v="$peak" 'BEGIN{exit !(v < -85)}'; then
+      printf '\n%s%sThe microphone is delivering pure silence (%s dB).%s\n' "$BOLD" $'\033[31m' "$peak" "$RESET" >&2
+      echo "Your terminal app almost certainly lacks microphone access:" >&2
+      echo "  System Settings > Privacy & Security > Microphone — enable it, then quit" >&2
+      echo "  and reopen the terminal. Or pick another input with -l / -d N." >&2
+      echo >&2
+    fi ) &
+fi
+
 if [ -n "$INFILE" ]; then echo "${BOLD}Rehearsal from $INFILE${RESET}"
 else echo "${BOLD}Recording device :$DEVICE${RESET}"; fi
 case "$MODE" in
@@ -294,7 +313,7 @@ if [ "$VAD" = 1 ]; then
   # ---- utterance driven: one line per phrase, cut in the silence around it ----
   FIFO="$RUN/.utts"; rm -f "$FIFO"; mkfifo "$FIFO"
   python3 "$SEGMENT" "$RAW" --workdir "$RUN" --rate "$RATE_CAP" \
-    --eof-idle 3.0 > "$FIFO" 2>>"$RUN/segment.log" &
+    --eof-idle 3.0 ${SEG_ARGS[@]+"${SEG_ARGS[@]}"} > "$FIFO" 2>>"$RUN/segment.log" &
   SEGPID=$!
   while read -r idx at; do
     utt="$RUN/.utt_$(printf '%05d' "$idx").wav"

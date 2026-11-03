@@ -69,6 +69,13 @@ One line per utterance. The Swedish appears about a second after the speaker pau
 the English follows roughly 1.6 s later, because it is not held back waiting for the
 translation.
 
+Continuous speech does not stall the screen: once an utterance passes 4 s, any short
+breath ends the line, and none runs past 7 s. On a 37 s unbroken monologue that gives an
+English line every 4–7 s (first after ~8.5 s), where a 12 s cap left gaps of 10–13 s.
+
+If the microphone delivers pure silence — what macOS does when the terminal lacks
+microphone permission — a red warning appears a few seconds in instead of an empty run.
+
 Segmenting on speech helps the translation as much as the transcription: a whole
 sentence translates correctly where a fragment does not. On fixed intervals the
 fragment "Framför" (the start of "framför allt personalkostnaderna") was rendered as
