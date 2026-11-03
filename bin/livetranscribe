@@ -14,7 +14,7 @@ SEGMENT="$HERE/lt-segment.py"
 XLATE="$HERE/lt-translate.py"
 source "$HERE/lt-llm.sh"
 
-DEVICE=0; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1; TIMED=0; KEEP_AUDIO=1
+DEVICE=default; INFILE=""; SEG=""; PREROLL=""; MODE=llm; ENGLISH=0; SUMMARY=1; TIMED=0; KEEP_AUDIO=1
 OUTDIR="${LT_OUTDIR:-$HOME/Documents/livetranscribe}"
 PORT="${LT_PORT:-8127}"
 RATE_CAP=48000                 # capture at the device's native rate — never

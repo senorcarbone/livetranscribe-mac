@@ -92,7 +92,7 @@ the Mac cannot keep up at your chosen step, it says so and you should raise `-s`
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `-d N` | audio input device index | `0` (MacBook Pro Microphone) |
+| `-d N` | audio input device index (`-l` lists them) | the macOS default input — not index 0, which BlackHole takes once installed |
 | `-s N` | seconds of new audio per step — lower = faster, more chopped | `4` |
 | `-o DIR` | output directory | `~/Documents/livetranscribe` (or `$LT_OUTDIR`) |
 | `-i FILE` | rehearse from an audio file instead of the mic | — |
