@@ -230,6 +230,8 @@ is_junk() {
   [ -z "$t" ] && return 0
   [ "${#t}" -lt 2 ] && return 0
   printf '%s' "$t" | grep -qEi "$JUNK" && return 0
+  # Whisper's stock output for murmur or crosstalk — only when it is the whole line.
+  printf '%s' "$t" | grep -qEi '^(tack så mycket|tack)[.!]?$' && return 0
   printf '%s' "$t" | grep -qE '^[[:punct:][:space:]]+$' && return 0
   return 1
 }
@@ -251,15 +253,21 @@ handle_chunk() {
   local ts sv en raw_sv raw_en
   ts=$(printf '%02d:%02d:%02d' $((at/3600)) $((at%3600/60)) $((at%60)))
   sv=""; en=""; raw_sv=""
-  loud_enough "$wav" || return 0
+  # Fixed windows can be pure room tone, so gate them. An utterance was already
+  # judged to be speech against the room's own noise floor; an absolute gate
+  # here dropped 21 of 30 utterances from a laptop mic at normal distance.
+  [ "$whole" = 1 ] || loud_enough "$wav" || return 0
 
   # CTX is the tail of what has actually been emitted. Whisper is given it as
   # --prompt, and for overlapping windows it is also what we dedupe against.
   # Using the previous raw output instead does not work: with a prompt, Whisper
   # sometimes *continues* from it rather than transcribing the whole window, so
   # the previous output is a fragment that later repeats cannot match.
+  # A whole utterance needs no prompt, and a prompt is how one hallucinated
+  # line ("Vi får en dåst.") became five in a row — Whisper copies it forward.
+  local prompt="$CTX"; [ "$whole" = 1 ] && prompt=""
   raw_sv=$(whisper-cli -m "$M_SV" -f "$wav" -l "$ASR_LANG" -nt -np -t "$THREADS" -bs 5 \
-             --prompt "$CTX" 2>/dev/null | clean)
+             --prompt "$prompt" 2>/dev/null | clean)
   if ! is_junk "$raw_sv"; then
     if [ "$whole" = 1 ]; then
       sv="$raw_sv"                       # utterance boundaries never overlap
